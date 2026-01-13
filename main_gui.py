@@ -42,6 +42,14 @@ class CursorSentinelApp(ctk.CTk):
         self.account_creator = AccountCreator()
         self.workbench_patcher = WorkbenchPatcher()
         self.profile_manager = ProfileManager()
+        self.backup_manager = BackupManager()
+        self.statistics_tracker = StatisticsTracker()
+        self.auto_scheduler = AutoScheduler()
+        self.browser_cleaner = BrowserCleaner()
+        
+        # Initialize scheduler callbacks
+        self.auto_scheduler.register_callback("reset", self._scheduled_reset)
+        self.auto_scheduler.start()
         
         # Configure window
         self.title("Cursor-Sentinel")
@@ -125,6 +133,7 @@ class CursorSentinelApp(ctk.CTk):
         control_panel.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
         control_panel.grid_columnconfigure(0, weight=1)
         control_panel.grid_columnconfigure(1, weight=1)
+        control_panel.grid_columnconfigure(2, weight=1)
         
         # Left column
         left_col = ctk.CTkFrame(control_panel)
@@ -295,6 +304,8 @@ class CursorSentinelApp(ctk.CTk):
                 self.log("Creating backup...")
                 success, msg = self.reset_engine.backup_files()
                 self.log(f"Backup: {msg}")
+                if success:
+                    self.statistics_tracker.record_backup(True)
                 self.progress_bar.set(0.6)
                 
                 # Step 3: Reset storage.json
@@ -313,6 +324,7 @@ class CursorSentinelApp(ctk.CTk):
                 self.log_ascii(SUCCESS_BANNER)
                 self.log("Quick reset completed successfully!")
                 print(SUCCESS_BANNER)  # Print to console
+                self.statistics_tracker.record_reset(True)
                 messagebox.showinfo("Reset Complete", "Quick reset completed successfully!")
                 self.update_status()
                 
@@ -365,9 +377,11 @@ class CursorSentinelApp(ctk.CTk):
             if success:
                 self.log_ascii(SUCCESS_BANNER)
                 self.log(f"{msg}")
+                self.statistics_tracker.record_workbench_patch(True)
                 messagebox.showinfo("Patch Complete", msg)
             else:
                 self.log(f"{msg}", level="ERROR")
+                self.statistics_tracker.record_workbench_patch(False)
                 messagebox.showerror("Patch Failed", msg)
         except Exception as e:
             self.log(f"Patch error: {str(e)}", level="ERROR")
@@ -424,7 +438,7 @@ class CursorSentinelApp(ctk.CTk):
     
     def open_profile_manager(self):
         """Open profile manager window"""
-        ProfileManagerWindow(self, self.profile_manager, self.reset_engine, self.log)
+        ProfileManagerWindow(self, self.profile_manager, self.reset_engine, self.statistics_tracker, self.log)
     
     def request_admin(self):
         """Request admin privileges"""
@@ -449,10 +463,11 @@ class CursorSentinelApp(ctk.CTk):
 class ProfileManagerWindow(ctk.CTkToplevel):
     """Profile Manager Window"""
     
-    def __init__(self, parent, profile_manager, reset_engine, log_callback):
+    def __init__(self, parent, profile_manager, reset_engine, statistics_tracker, log_callback):
         super().__init__(parent)
         self.profile_manager = profile_manager
         self.reset_engine = reset_engine
+        self.statistics_tracker = statistics_tracker
         self.log_callback = log_callback
         
         self.title("Profile Manager")
@@ -530,10 +545,12 @@ class ProfileManagerWindow(ctk.CTkToplevel):
         if success:
             self.log_callback(SUCCESS_BANNER)
             self.log_callback(f"Applied profile: {profile_name}")
+            self.statistics_tracker.record_profile_switch(profile_name, True)
             messagebox.showinfo("Success", msg)
             self.destroy()
         else:
             self.log_callback(f"Failed to apply profile: {msg}", level="ERROR")
+            self.statistics_tracker.record_profile_switch(profile_name, False)
             messagebox.showerror("Error", msg)
     
     def save_current(self):
@@ -570,6 +587,362 @@ class ProfileManagerWindow(ctk.CTkToplevel):
                 self.refresh_profiles()
             else:
                 self.log_callback(f"Failed to delete profile: {msg}", level="ERROR")
+                messagebox.showerror("Error", msg)
+
+
+class BackupManagerWindow(ctk.CTkToplevel):
+    """Backup Manager Window"""
+    
+    def __init__(self, parent, backup_manager, reset_engine, log_callback):
+        super().__init__(parent)
+        self.backup_manager = backup_manager
+        self.reset_engine = reset_engine
+        self.log_callback = log_callback
+        
+        self.title("Backup Manager")
+        self.geometry("800x600")
+        self.transient(parent)
+        
+        self._create_ui()
+        self.refresh_backups()
+    
+    def _create_ui(self):
+        """Create backup manager UI"""
+        header = ctk.CTkLabel(self, text="Backup Manager", font=ctk.CTkFont(size=20, weight="bold"))
+        header.pack(pady=20)
+        
+        list_frame = ctk.CTkFrame(self)
+        list_frame.pack(pady=10, padx=20, fill="both", expand=True)
+        
+        scrollbar = ctk.CTkScrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.backup_listbox = tk.Listbox(
+            list_frame,
+            yscrollcommand=scrollbar.set,
+            bg="#2b2b2b",
+            fg="white",
+            font=("Consolas", 11),
+            selectbackground="#1f538d"
+        )
+        self.backup_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.backup_listbox.yview)
+        
+        buttons_frame = ctk.CTkFrame(self)
+        buttons_frame.pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkButton(buttons_frame, text="Restore", command=self.restore_backup).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Delete", command=self.delete_backup).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Refresh", command=self.refresh_backups).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Close", command=self.destroy).pack(side="right", padx=5)
+    
+    def refresh_backups(self):
+        """Refresh backup list"""
+        self.backup_listbox.delete(0, "end")
+        backups = self.backup_manager.list_backups()
+        from utils import format_file_size
+        for backup in backups:
+            size = format_file_size(backup["size"])
+            created = backup.get("created", "Unknown")[:10]
+            self.backup_listbox.insert("end", f"{backup['name']} | {size} | {created}")
+    
+    def restore_backup(self):
+        """Restore selected backup"""
+        selection = self.backup_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a backup to restore.")
+            return
+        
+        backup_name = self.backup_listbox.get(selection[0]).split(" |")[0]
+        if messagebox.askyesno("Confirm Restore", f"Restore backup '{backup_name}'?"):
+            success, msg = self.backup_manager.restore_backup(backup_name)
+            if success:
+                self.log_callback(f"Restored backup: {backup_name}")
+                messagebox.showinfo("Success", msg)
+                self.destroy()
+            else:
+                self.log_callback(f"Failed to restore backup: {msg}", level="ERROR")
+                messagebox.showerror("Error", msg)
+    
+    def delete_backup(self):
+        """Delete selected backup"""
+        selection = self.backup_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a backup to delete.")
+            return
+        
+        backup_name = self.backup_listbox.get(selection[0]).split(" |")[0]
+        if messagebox.askyesno("Confirm Delete", f"Delete backup '{backup_name}'?"):
+            success, msg = self.backup_manager.delete_backup(backup_name)
+            if success:
+                self.log_callback(f"Deleted backup: {backup_name}")
+                messagebox.showinfo("Success", msg)
+                self.refresh_backups()
+            else:
+                self.log_callback(f"Failed to delete backup: {msg}", level="ERROR")
+                messagebox.showerror("Error", msg)
+
+
+class StatisticsWindow(ctk.CTkToplevel):
+    """Statistics Window"""
+    
+    def __init__(self, parent, statistics_tracker, log_callback):
+        super().__init__(parent)
+        self.statistics_tracker = statistics_tracker
+        self.log_callback = log_callback
+        
+        self.title("Statistics")
+        self.geometry("700x500")
+        self.transient(parent)
+        
+        self._create_ui()
+        self.update_statistics()
+    
+    def _create_ui(self):
+        """Create statistics UI"""
+        header = ctk.CTkLabel(self, text="Statistics Dashboard", font=ctk.CTkFont(size=20, weight="bold"))
+        header.pack(pady=20)
+        
+        stats_frame = ctk.CTkFrame(self)
+        stats_frame.pack(pady=10, padx=20, fill="both", expand=True)
+        
+        self.stats_text = ctk.CTkTextbox(stats_frame, font=ctk.CTkFont(family="Consolas", size=11))
+        self.stats_text.pack(pady=10, padx=10, fill="both", expand=True)
+        
+        buttons_frame = ctk.CTkFrame(self)
+        buttons_frame.pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkButton(buttons_frame, text="Refresh", command=self.update_statistics).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Reset Stats", command=self.reset_statistics).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Close", command=self.destroy).pack(side="right", padx=5)
+    
+    def update_statistics(self):
+        """Update statistics display"""
+        stats = self.statistics_tracker.get_statistics()
+        
+        text = "STATISTICS OVERVIEW\n"
+        text += "=" * 50 + "\n\n"
+        text += f"Total Resets: {stats.get('total_resets', 0)}\n"
+        text += f"Total Backups: {stats.get('total_backups', 0)}\n"
+        text += f"Profile Switches: {stats.get('total_profile_switches', 0)}\n"
+        text += f"Immortality Mode Activations: {stats.get('immortality_mode_enabled_count', 0)}\n"
+        text += f"Workbench Patches: {stats.get('workbench_patches', 0)}\n"
+        text += f"Account Creations: {stats.get('account_creations', 0)}\n\n"
+        text += f"First Use: {stats.get('first_use', 'Unknown')[:10]}\n"
+        text += f"Last Reset: {stats.get('last_reset', 'Never')[:10] if stats.get('last_reset') else 'Never'}\n"
+        text += f"Last Backup: {stats.get('last_backup', 'Never')[:10] if stats.get('last_backup') else 'Never'}\n\n"
+        text += "OPERATION COUNTS\n"
+        text += "=" * 50 + "\n"
+        
+        counts = self.statistics_tracker.get_operation_count_by_type()
+        for op_type, count in sorted(counts.items()):
+            text += f"{op_type}: {count}\n"
+        
+        self.stats_text.delete("1.0", "end")
+        self.stats_text.insert("1.0", text)
+    
+    def reset_statistics(self):
+        """Reset all statistics"""
+        if messagebox.askyesno("Confirm Reset", "Reset all statistics?"):
+            self.statistics_tracker.reset_statistics()
+            self.update_statistics()
+            self.log_callback("Statistics reset")
+
+
+class SchedulerWindow(ctk.CTkToplevel):
+    """Auto Scheduler Window"""
+    
+    def __init__(self, parent, auto_scheduler, log_callback):
+        super().__init__(parent)
+        self.auto_scheduler = auto_scheduler
+        self.log_callback = log_callback
+        
+        self.title("Auto Scheduler")
+        self.geometry("700x500")
+        self.transient(parent)
+        
+        self._create_ui()
+        self.refresh_schedules()
+    
+    def _create_ui(self):
+        """Create scheduler UI"""
+        header = ctk.CTkLabel(self, text="Auto Scheduler", font=ctk.CTkFont(size=20, weight="bold"))
+        header.pack(pady=20)
+        
+        list_frame = ctk.CTkFrame(self)
+        list_frame.pack(pady=10, padx=20, fill="both", expand=True)
+        
+        scrollbar = ctk.CTkScrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.schedule_listbox = tk.Listbox(
+            list_frame,
+            yscrollcommand=scrollbar.set,
+            bg="#2b2b2b",
+            fg="white",
+            font=("Consolas", 11),
+            selectbackground="#1f538d"
+        )
+        self.schedule_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.schedule_listbox.yview)
+        
+        buttons_frame = ctk.CTkFrame(self)
+        buttons_frame.pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkButton(buttons_frame, text="Add Schedule", command=self.add_schedule).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Remove", command=self.remove_schedule).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Toggle", command=self.toggle_schedule).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Refresh", command=self.refresh_schedules).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Close", command=self.destroy).pack(side="right", padx=5)
+    
+    def refresh_schedules(self):
+        """Refresh schedule list"""
+        self.schedule_listbox.delete(0, "end")
+        schedules = self.auto_scheduler.list_schedules()
+        for schedule in schedules:
+            status = "ENABLED" if schedule.get("enabled") else "DISABLED"
+            interval = schedule.get("interval_hours", 24)
+            schedule_type = schedule.get("type", "reset")
+            self.schedule_listbox.insert("end", f"{schedule['id']} | {schedule_type} | Every {interval}h | {status}")
+    
+    def add_schedule(self):
+        """Add new schedule"""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add Schedule")
+        dialog.geometry("400x300")
+        dialog.transient(self)
+        
+        ctk.CTkLabel(dialog, text="Schedule ID:").pack(pady=5)
+        id_entry = ctk.CTkEntry(dialog, width=300)
+        id_entry.pack(pady=5)
+        
+        ctk.CTkLabel(dialog, text="Type (reset/backup):").pack(pady=5)
+        type_entry = ctk.CTkEntry(dialog, width=300)
+        type_entry.pack(pady=5)
+        
+        ctk.CTkLabel(dialog, text="Interval (hours):").pack(pady=5)
+        interval_entry = ctk.CTkEntry(dialog, width=300)
+        interval_entry.pack(pady=5)
+        
+        def save_schedule():
+            schedule_id = id_entry.get()
+            schedule_type = type_entry.get()
+            try:
+                interval = int(interval_entry.get())
+                success, msg = self.auto_scheduler.add_schedule(schedule_id, schedule_type, interval)
+                if success:
+                    messagebox.showinfo("Success", msg)
+                    self.refresh_schedules()
+                    dialog.destroy()
+                else:
+                    messagebox.showerror("Error", msg)
+            except ValueError:
+                messagebox.showerror("Error", "Interval must be a number")
+        
+        ctk.CTkButton(dialog, text="Add", command=save_schedule).pack(pady=20)
+    
+    def remove_schedule(self):
+        """Remove selected schedule"""
+        selection = self.schedule_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a schedule to remove.")
+            return
+        
+        schedule_id = self.schedule_listbox.get(selection[0]).split(" |")[0]
+        if messagebox.askyesno("Confirm Remove", f"Remove schedule '{schedule_id}'?"):
+            success, msg = self.auto_scheduler.remove_schedule(schedule_id)
+            if success:
+                self.log_callback(f"Removed schedule: {schedule_id}")
+                messagebox.showinfo("Success", msg)
+                self.refresh_schedules()
+            else:
+                messagebox.showerror("Error", msg)
+    
+    def toggle_schedule(self):
+        """Toggle selected schedule"""
+        selection = self.schedule_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a schedule to toggle.")
+            return
+        
+        schedule_id = self.schedule_listbox.get(selection[0]).split(" |")[0]
+        schedules = self.auto_scheduler.list_schedules()
+        schedule = next((s for s in schedules if s["id"] == schedule_id), None)
+        
+        if schedule:
+            if schedule.get("enabled"):
+                success, msg = self.auto_scheduler.disable_schedule(schedule_id)
+            else:
+                success, msg = self.auto_scheduler.enable_schedule(schedule_id)
+            
+            if success:
+                self.refresh_schedules()
+            else:
+                messagebox.showerror("Error", msg)
+
+
+class BrowserCleanerWindow(ctk.CTkToplevel):
+    """Browser Cleaner Window"""
+    
+    def __init__(self, parent, browser_cleaner, log_callback):
+        super().__init__(parent)
+        self.browser_cleaner = browser_cleaner
+        self.log_callback = log_callback
+        
+        self.title("Browser Cleaner")
+        self.geometry("600x400")
+        self.transient(parent)
+        
+        self._create_ui()
+        self.update_info()
+    
+    def _create_ui(self):
+        """Create browser cleaner UI"""
+        header = ctk.CTkLabel(self, text="Browser Cleaner", font=ctk.CTkFont(size=20, weight="bold"))
+        header.pack(pady=20)
+        
+        info_frame = ctk.CTkFrame(self)
+        info_frame.pack(pady=10, padx=20, fill="both", expand=True)
+        
+        self.info_text = ctk.CTkTextbox(info_frame, font=ctk.CTkFont(family="Consolas", size=11))
+        self.info_text.pack(pady=10, padx=10, fill="both", expand=True)
+        
+        buttons_frame = ctk.CTkFrame(self)
+        buttons_frame.pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkButton(buttons_frame, text="Clear Cache", command=self.clear_cache).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Refresh", command=self.update_info).pack(side="left", padx=5)
+        ctk.CTkButton(buttons_frame, text="Close", command=self.destroy).pack(side="right", padx=5)
+    
+    def update_info(self):
+        """Update browser info"""
+        info = self.browser_cleaner.get_browser_data_info()
+        
+        text = "BROWSER DATA INFORMATION\n"
+        text += "=" * 50 + "\n\n"
+        text += f"System: {info.get('system', 'Unknown')}\n\n"
+        
+        for browser, browser_info in info.get("browsers", {}).items():
+            text += f"{browser.upper()}:\n"
+            paths = browser_info.get("paths", [])
+            exists = browser_info.get("exists", [])
+            for path, exist in zip(paths, exists):
+                status = "EXISTS" if exist else "NOT FOUND"
+                text += f"  {path}: {status}\n"
+            text += "\n"
+        
+        self.info_text.delete("1.0", "end")
+        self.info_text.insert("1.0", text)
+    
+    def clear_cache(self):
+        """Clear browser cache"""
+        if messagebox.askyesno("Confirm", "Clear browser cache? This may close open browsers."):
+            success, msg = self.browser_cleaner.clear_cache_only()
+            if success:
+                self.log_callback(f"Browser cache cleared: {msg}")
+                messagebox.showinfo("Success", msg)
+            else:
+                self.log_callback(f"Failed to clear cache: {msg}", level="ERROR")
                 messagebox.showerror("Error", msg)
 
 
